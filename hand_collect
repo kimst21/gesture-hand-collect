@@ -1,0 +1,323 @@
+# ============================================================
+# hand_collect.py
+# Edge AI 시리즈 2편 - 학습 데이터 수집 도구
+#
+# 변경 사항 (v2):
+#   - 키보드 단축키 방식 -> Pico WiFi UDP 트리거 방식으로 변경
+#   - 사용자가 PC 키보드 만질 필요 없음 -> 양손 자유
+#   - 별도 스레드에서 4220 포트로 Pico의 "CAPTURE,<class>" 수신
+#
+# 동작 흐름:
+#   1. 매 프레임: ESP32-CAM 영상 수신 -> MediaPipe 검출 -> segmenter 호출
+#                결과를 latest_segmented 변수에 캐싱
+#   2. Pico 버튼 클릭: WiFi UDP로 "CAPTURE,fist" 같은 메시지 도착
+#   3. UDP 수신 스레드: 메시지 받으면 latest_segmented를 클래스 폴더에 저장
+# ============================================================
+
+import os
+import socket
+import threading
+import cv2
+import mediapipe as mp
+
+from segmenter import segment_hand_to_96x96, to_grayscale
+
+
+# ============================================================
+# 사용자 설정 - 본인 환경에 맞게 수정
+# ============================================================
+ESP32_IP   = "192.168.219.xxx"
+ESP32_PORT = 4210
+URL        = "http://192.168.219.xxx:81/stream"
+
+# Pico에서 보내는 캡처 트리거를 받을 포트
+TRIGGER_PORT = 4220
+
+# 데이터 저장 루트 폴더
+DATASET_ROOT = r"C:\dataset"
+
+# 수집할 클래스 목록
+CLASS_NAMES = ["fist", "index", "victory", "ok"]
+
+# 저장 형식
+SAVE_AS_GRAYSCALE = True   # True: grayscale PNG, False: BGR PNG
+
+
+# ============================================================
+# 폴더 준비
+# ============================================================
+def prepare_dirs(root, classes):
+    """클래스별 폴더 생성, 기존 PNG 개수를 카운트로 반환"""
+    counts = {}
+    for cls in classes:
+        cls_dir = os.path.join(root, cls)
+        os.makedirs(cls_dir, exist_ok=True)
+        existing = [f for f in os.listdir(cls_dir) if f.lower().endswith('.png')]
+        counts[cls] = len(existing)
+    return counts
+
+
+# ============================================================
+# 저장 함수
+# ============================================================
+def save_sample(img_bgr, class_name, current_count):
+    """segmented 이미지를 클래스 폴더에 저장. fist_0001.png 형식."""
+    if SAVE_AS_GRAYSCALE:
+        img_to_save = to_grayscale(img_bgr)
+    else:
+        img_to_save = img_bgr
+
+    filename = "{}_{:04d}.png".format(class_name, current_count + 1)
+    filepath = os.path.join(DATASET_ROOT, class_name, filename)
+    cv2.imwrite(filepath, img_to_save)
+    return filepath
+
+
+# ============================================================
+# 공유 상태 (메인 스레드와 UDP 수신 스레드 사이)
+# ============================================================
+latest_segmented = None        # 가장 최근의 96x96 BGR 이미지 (또는 None)
+latest_lock      = threading.Lock()
+counts           = prepare_dirs(DATASET_ROOT, CLASS_NAMES)
+running          = True
+
+
+# ============================================================
+# UDP 수신 스레드 - Pico의 트리거 처리
+# ============================================================
+def udp_trigger_listener():
+    """Pico에서 보낸 'CAPTURE,<class>' 메시지를 받아 저장 처리."""
+    global counts
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", TRIGGER_PORT))
+    s.settimeout(0.5)
+    print("[UDP] 트리거 수신 대기 중 (포트 {})".format(TRIGGER_PORT))
+
+    while running:
+        try:
+            data, addr = s.recvfrom(64)
+        except socket.timeout:
+            continue
+        except Exception as e:
+            print("[UDP] 오류:", e)
+            continue
+
+        try:
+            msg = data.decode().strip()
+        except Exception:
+            continue
+
+        # 형식: "CAPTURE,<class>"
+        if not msg.startswith("CAPTURE,"):
+            print("[UDP] 알 수 없는 메시지:", msg)
+            continue
+
+        parts = msg.split(",")
+        if len(parts) != 2:
+            continue
+
+        class_name = parts[1].strip()
+        if class_name not in CLASS_NAMES:
+            print("[UDP] 알 수 없는 클래스:", class_name)
+            continue
+
+        # 가장 최근 segmented 결과 확인
+        with latest_lock:
+            seg = latest_segmented.copy() if latest_segmented is not None else None
+
+        if seg is None:
+            print("  [skip] 손이 검출되지 않아 {} 저장 안 함".format(class_name))
+            continue
+
+        # 저장
+        save_sample(seg, class_name, counts[class_name])
+        counts[class_name] += 1
+        print("  [save] {}_{:04d}.png (누적 {}장)".format(
+            class_name, counts[class_name], counts[class_name]))
+
+    s.close()
+    print("[UDP] 종료")
+
+
+# ============================================================
+# UDP 송신 (PanTilt 좌표용, 1편과 동일)
+# ============================================================
+sock_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+# ============================================================
+# MediaPipe 초기화 (1편과 동일)
+# ============================================================
+mp_hands = mp.solutions.hands
+mp_draw  = mp.solutions.drawing_utils
+
+hands = mp_hands.Hands(
+    max_num_hands=1,
+    model_complexity=0,
+    min_detection_confidence=0.3,
+    min_tracking_confidence=0.3
+)
+
+cap = cv2.VideoCapture(URL)
+print("Stream open:", cap.isOpened())
+
+
+# ============================================================
+# 추적 상태 (1편과 동일)
+# ============================================================
+last_x = -1
+last_y = -1
+miss_count = 0
+MAX_MISS = 20
+
+x_history = []
+y_history = []
+SMOOTH_N = 8
+
+
+# ============================================================
+# 시작 안내
+# ============================================================
+print("\n=== 데이터 수집 시작 ===")
+print("저장 위치: {}".format(DATASET_ROOT))
+print("저장 형식: {} PNG".format("grayscale" if SAVE_AS_GRAYSCALE else "BGR"))
+print("\n동작 방식:")
+print("  Pico의 캡처 버튼(GPIO27)을 누르면 PC에 트리거 도착")
+print("  Pico의 전환 버튼(GPIO14)으로 클래스 변경")
+print("  PC 키 입력: q (종료) / p (미리보기 토글)")
+print("\n현재 수집 개수:")
+for cls in CLASS_NAMES:
+    print("  {:10s}: {:3d} 장".format(cls, counts[cls]))
+print()
+
+
+# ============================================================
+# UDP 수신 스레드 시작
+# ============================================================
+trigger_thread = threading.Thread(target=udp_trigger_listener, daemon=True)
+trigger_thread.start()
+
+
+# ============================================================
+# 미리보기 토글
+# ============================================================
+show_preview = True
+
+
+# ============================================================
+# 메인 루프
+# ============================================================
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb)
+        h, w, _ = frame.shape
+
+        current_seg = None
+        landmarks_valid = False
+
+        # ----- 손이 검출된 경우 -----
+        if results.multi_hand_landmarks:
+            for hl in results.multi_hand_landmarks:
+                mp_draw.draw_landmarks(frame, hl, mp_hands.HAND_CONNECTIONS)
+
+                # 1편과 동일 - PanTilt 추적용 좌표 송신
+                palm = hl.landmark[9]
+                px = int(palm.x * w)
+                py = int(palm.y * h)
+
+                x_history.append(px)
+                y_history.append(py)
+                if len(x_history) > SMOOTH_N:
+                    x_history.pop(0)
+                    y_history.pop(0)
+
+                avg_x = int(sum(x_history) / len(x_history))
+                avg_y = int(sum(y_history) / len(y_history))
+
+                cv2.circle(frame, (avg_x, avg_y), 15, (0, 0, 255), -1)
+
+                last_x = avg_x
+                last_y = avg_y
+                miss_count = 0
+
+                msg = "P,{},{}".format(avg_x, avg_y)
+                sock_tx.sendto(msg.encode(), (ESP32_IP, ESP32_PORT))
+
+                # 2편 - segmentation 캐싱
+                seg = segment_hand_to_96x96(frame.copy(), hl)
+                if seg is not None:
+                    current_seg = seg
+                    landmarks_valid = True
+
+                break   # 첫 번째 손만
+
+        else:
+            # 손이 없을 때 - 1편과 동일
+            miss_count += 1
+            if miss_count < MAX_MISS and last_x >= 0:
+                msg = "P,{},{}".format(last_x, last_y)
+                sock_tx.sendto(msg.encode(), (ESP32_IP, ESP32_PORT))
+            else:
+                sock_tx.sendto(b"N", (ESP32_IP, ESP32_PORT))
+
+        # 공유 변수 갱신 (UDP 스레드가 읽을 값)
+        with latest_lock:
+            latest_segmented = current_seg
+
+        # ----- 화면 표시 -----
+        y_text = 25
+        cv2.putText(frame, "Pico btn = capture",
+                    (10, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (255, 255, 255), 1)
+        y_text += 20
+        for cls in CLASS_NAMES:
+            line = "{}: {:3d}".format(cls, counts[cls])
+            cv2.putText(frame, line, (10, y_text),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 255, 0) if counts[cls] >= 100 else (255, 255, 255), 1)
+            y_text += 18
+
+        if landmarks_valid:
+            cv2.putText(frame, "READY", (w - 90, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 255, 0), 2)
+        else:
+            cv2.putText(frame, "NO HAND", (w - 110, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 100, 255), 2)
+
+        cv2.imshow("ESP32-CAM Collect", frame)
+
+        # 미리보기 창
+        if show_preview and current_seg is not None:
+            preview = cv2.resize(current_seg, (240, 240),
+                                 interpolation=cv2.INTER_NEAREST)
+            cv2.imshow("Segmented Preview (240x240 of 96x96)", preview)
+
+        # ----- 키 입력 (q 종료, p 미리보기 토글) -----
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('p'):
+            show_preview = not show_preview
+            if not show_preview:
+                cv2.destroyWindow("Segmented Preview (240x240 of 96x96)")
+            print("미리보기: {}".format("ON" if show_preview else "OFF"))
+
+finally:
+    running = False
+    cap.release()
+    cv2.destroyAllWindows()
+    sock_tx.close()
+    trigger_thread.join(timeout=1.0)
+
+    print("\n=== 수집 완료 ===")
+    for cls in CLASS_NAMES:
+        print("  {:10s}: {:3d} 장".format(cls, counts[cls]))
+
